@@ -1,0 +1,9 @@
+*.d
+*.o
+*.mk
+*.lst
+*.elf
+*.map
+*.hex
+build/
+projects/doxygen/html/

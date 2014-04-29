@@ -61,6 +61,8 @@ static volatile bool        m_paused = false;
 
 /* Then scale them back (will produce a slight rounding error) */
 #define TO_RAW_COEFF(f)     ((f) / 10)
+
+/* Define coefficients for proportional, integral and derivative parts */
 #define P_COEFF             (1.0)
 #define I_COEFF             (0.4)
 #define D_COEFF             (0.4)
@@ -88,13 +90,15 @@ static pid_controller_t     m_pid_controller = {{TO_DECIMAL_COEFF(P_COEFF),
 /* Define ADC / PWM characteristics */
 #define max(a, b)           ((a) > (b) ? (a) : (b))
 #define min(a, b)           ((a) < (b) ? (a) : (b))
-#define adc_ref_mv          5000u
+#define adc_ref_mv          5000u /* Vdd offset will cause error in output */
 #define adc_max             1024u
+
 /* Avoid singularity with NULDIV check */
 #define adc_to_mv(adc)      adc == 0 ? 0 : \
                             ((uint32_t)((uint32_t)(adc) * adc_ref_mv) / adc_max)
 #define pwm_max_volt        5000u
 #define pwm_max_value       255u
+
 /* Avoid singularity with NULDIV check */
 #define mv_to_pwm(mv)       mv == 0 ? 0 : \
                             ((uint32_t)((uint32_t)(mv) * pwm_max_value) / pwm_max_volt)
@@ -118,8 +122,8 @@ int16_t pid_run(int16_t target,
     p = pid->coeffs.p * error;
     /* I-part: Error can over/underflow... */
     i = pid->i_part + error;
-    /* But cap values at -32767...32767 */
-    i = max(i, -INT16_MAX);
+    /* But cap values at -32768...32767 */
+    i = max(i, INT16_MIN);
     i = min(i, INT16_MAX);
     /* Store error and calculate I-part */
     pid->i_part = i;
@@ -128,9 +132,12 @@ int16_t pid_run(int16_t target,
     d = pid->d_part - meas;
     d *= pid->coeffs.d;
     pid->d_part = meas;
+    /* Calculate PID output */
     sum = p + i + d;
+    /* Scale down (coefficents were scaled up by 10) */
     sum = TO_RAW_COEFF(sum);
-    sum = max(sum, -INT16_MAX);
+    /* Sum might over/underflow: cap values at output scale */
+    sum = max(sum, INT16_MIN);
     sum = min(sum, INT16_MAX);
     return (int16_t)(sum);
 }
@@ -200,6 +207,7 @@ void print_status(void)
                    pwm_set_latch);
     if(print_del++ > 1000)
     {
+        /* Delay status printing so we don't flood user terminal */
         serial_write((void*)m_print_buf, len);
         print_del = 0;
     }

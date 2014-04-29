@@ -56,8 +56,10 @@ static volatile bool        m_paused = false;
 #define output_disable()    do{TCCR2A &= ~(1 << COM2A1);}while(0)
 #define output_enable()     do{TCCR2A |= (1 << COM2A1);}while(0)
 
-/* PWM/PID values */
+/* PWM/PID values (Scale floating point coefficients to decimal) */
 #define TO_DECIMAL_COEFF(d) ((d) * 10)
+
+/* Then scale them back (will produce a slight rounding error) */
 #define TO_RAW_COEFF(f)     ((f) / 10)
 #define P_COEFF             (1.0)
 #define I_COEFF             (0.4)
@@ -88,10 +90,12 @@ static pid_controller_t     m_pid_controller = {{TO_DECIMAL_COEFF(P_COEFF),
 #define min(a, b)           ((a) < (b) ? (a) : (b))
 #define adc_ref_mv          5000u
 #define adc_max             1024u
+/* Avoid singularity with NULDIV check */
 #define adc_to_mv(adc)      adc == 0 ? 0 : \
                             ((uint32_t)((uint32_t)(adc) * adc_ref_mv) / adc_max)
 #define pwm_max_volt        5000u
 #define pwm_max_value       255u
+/* Avoid singularity with NULDIV check */
 #define mv_to_pwm(mv)       mv == 0 ? 0 : \
                             ((uint32_t)((uint32_t)(mv) * pwm_max_value) / pwm_max_volt)
 #define pwm_fb_enable()     do{ADCSRA |= (1 << ADIE); ADCSRA |= (1 << ADSC);}while(0)
@@ -165,7 +169,6 @@ void serial_write(void * buf,
 
 void serve_serial(void)
 {
-    uint8_t pwm_set_latch = 0, len = 0;
     int16_t ch = serial_read();
     if(ch >= '0' && ch <= '5')
     {
@@ -178,6 +181,12 @@ void serve_serial(void)
             __enable_irq();
         }
     }
+}
+
+void print_status(void)
+{
+    uint8_t pwm_set_latch = 0, len = 0;
+    static uint16_t print_del = 0;
     /* For some mysterious reason INT0 starts oscillating on
      * rising edge, when PORTD 2 is driven (serial TX) */
     __disable_irq();
@@ -189,7 +198,11 @@ void serve_serial(void)
                    "pwm_out:%u\n",
                    m_pwm_target_value,
                    pwm_set_latch);
-    serial_write((void*)m_print_buf, len);
+    if(print_del++ > 1000)
+    {
+        serial_write((void*)m_print_buf, len);
+        print_del = 0;
+    }
 }
 
 void serial_init(void)
@@ -296,6 +309,7 @@ int main(void)
     while(1)
     {
         serve_serial();
+        print_status();
     }
     return 0;
 }

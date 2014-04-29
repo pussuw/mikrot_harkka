@@ -20,7 +20,7 @@ static volatile bool        m_paused = false;
 #define pause_led_on()      do{PORTB |= (1 << 5);}while(0)
 #define pause_led_off()     do{PORTB &= ~(1 << 5);}while(0)
 
-/* Toggle led on compare match */
+/* Clear pin on compare match */
 #define output_disable()    do{TCCR2A &= ~(1 << COM2A1);}while(0)
 #define output_enable()     do{TCCR2A |= (1 << COM2A1);}while(0)
 
@@ -46,8 +46,8 @@ static pidData_t            m_pid;
 
 void serve_serial(void)
 {
-    int16_t ch = serial_read();
     uint8_t pwm_set_latch = 0, len = 0;
+    int16_t ch = serial_read();
     if(ch >= '0' && ch <= '5')
     {
         int16_t new_target = ch - '0';
@@ -59,6 +59,8 @@ void serve_serial(void)
             __enable_irq();
         }
     }
+    /* For some mysterious reason INT0 starts oscillating on
+     * rising edge, when PORTD 2 is driven (serial TX) */
     __disable_irq();
     pwm_set_latch = m_pwm_set_value;
     __enable_irq();
@@ -115,7 +117,7 @@ void init(void)
     /* INT0 Pin:
      * Falling edge triggers interrupt */
     EIFR |= 0x01;
-    EICRA = 0x02;
+    EICRA = (1 << ISC01);
     EIMSK = 0x01;
     pause_led_off();
 
@@ -139,7 +141,6 @@ void init(void)
      * Measures the output voltage of PWM LPF
      * Interrupt for conversion ready
      * ISR runs PID, which sets value for CC2A */
-
     pwm_fb_disable();
     ADMUX = (1 << REFS0);
     ADCSRA = ((1 << ADEN) |
@@ -202,6 +203,7 @@ ISR(ADC_vect)
 
 ISR(INT0_vect)
 {
+    PORTB ^= 0x01;
     if(m_paused)
     {
         /* Resume */

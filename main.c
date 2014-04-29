@@ -11,9 +11,41 @@
 #include <string.h>
 #include <avr/io.h>
 #include <avr/interrupt.h>
-#include "globaldef.h"
-#include "serial.h"
-#include "pid.h"
+
+/* Global defines */
+#ifndef __cplusplus
+#undef false
+#undef true
+#undef bool
+typedef enum {false, true} bool;
+#endif
+
+#define __enable_irq()          sei()
+#define __disable_irq()         cli()
+
+/* Serial port */
+#define MCU_FREQUENCY           16000000ul
+#define BAUDRATE                9600ul
+#define PRESCALER(BAUD, FREQ)   ((FREQ / (BAUD * 16u)) - 1)
+#define RECEIVE_BUFFER          128
+
+#if RECEIVE_BUFFER < 2
+#error RECEIVE_BUFFER is too small.  It must be larger than 1.
+#elif ((RECEIVE_BUFFER & (RECEIVE_BUFFER-1)) != 0)
+#error RECEIVE_BUFFER must be a power of 2.
+#endif
+
+typedef struct
+{
+    uint16_t    in;                    // Next In Index
+    uint16_t    out;                   // Next Out Index
+    uint8_t     buf[RECEIVE_BUFFER];   // Buffer
+} ring_buffer_t;
+
+#define RINGBUFFER_ELEMENTS(p) ((uint16_t)((p).in - (p).out))
+
+/* Serial RX ringbuffer */
+static ring_buffer_t        m_uart_rx_buf = {0, 0, };
 
 /* Pause feature */
 static volatile bool        m_paused = false;
@@ -25,6 +57,33 @@ static volatile bool        m_paused = false;
 #define output_enable()     do{TCCR2A |= (1 << COM2A1);}while(0)
 
 /* PWM/PID values */
+#define TO_DECIMAL_COEFF(d) ((d) * 10)
+#define TO_RAW_COEFF(f)     ((f) / 10)
+#define P_COEFF             (1.0)
+#define I_COEFF             (0.4)
+#define D_COEFF             (0.4)
+
+typedef struct
+{
+    struct
+    {
+        /* Coefficients */
+        uint8_t p;
+        uint8_t i;
+        uint8_t d;
+    }coeffs;
+    int16_t d_part;
+    int16_t i_part;
+}pid_controller_t;
+
+/* Initialize PID Controller */
+#define reset_pid(p)        ((p).i_part = 0)
+static pid_controller_t     m_pid_controller = {{TO_DECIMAL_COEFF(P_COEFF),
+                                                 TO_DECIMAL_COEFF(I_COEFF),
+                                                 TO_DECIMAL_COEFF(D_COEFF)},
+                                                0, 0};
+
+/* Define ADC / PWM characteristics */
 #define max(a, b)           ((a) > (b) ? (a) : (b))
 #define min(a, b)           ((a) < (b) ? (a) : (b))
 #define adc_ref_mv          5000u
@@ -42,7 +101,67 @@ static volatile bool        m_paused = false;
 static volatile int16_t     m_pwm_target_value = 0;
 static volatile uint8_t     m_pwm_set_value = 0;
 static volatile uint8_t     m_print_buf[256];
-static pidData_t            m_pid;
+
+int16_t pid_run(int16_t target,
+                int16_t meas,
+                pid_controller_t * pid)
+{
+    /* Error : -65535...65535 */
+    int32_t error;
+    int32_t p, d, i, sum;
+    error = target - meas;
+    /* D-part: Cannot over/underflow (0xFF * 0xFFFF) = 0xFFFFFF */
+    p = pid->coeffs.p * error;
+    /* I-part: Error can over/underflow... */
+    i = pid->i_part + error;
+    /* But cap values at -32767...32767 */
+    i = max(i, -INT16_MAX);
+    i = min(i, INT16_MAX);
+    /* Store error and calculate I-part */
+    pid->i_part = i;
+    i *= pid->coeffs.i;
+    /* D-part */
+    d = pid->d_part - meas;
+    d *= pid->coeffs.d;
+    pid->d_part = meas;
+    sum = p + i + d;
+    sum = TO_RAW_COEFF(sum);
+    sum = max(sum, -INT16_MAX);
+    sum = min(sum, INT16_MAX);
+    return (int16_t)(sum);
+}
+
+int16_t serial_read(void)
+{
+    int16_t ret;
+    ring_buffer_t *p = &m_uart_rx_buf;
+    __disable_irq();
+    if (RINGBUFFER_ELEMENTS(*p) == 0)
+    {
+        /* Buffer empty */
+        ret = (-1);
+    }
+    else
+    {
+        /* Return item from tail */
+        ret = (p->buf[(p->out++) & (RECEIVE_BUFFER - 1)]);
+    }
+    __enable_irq();
+    return ret;
+}
+
+void serial_write(void * buf,
+                  uint8_t len)
+{
+    uint8_t * p = (uint8_t*) buf;
+    while(len-- != 0)
+    {
+        while((UCSR0A & (1 << UDRE0)) == 0)
+        {
+        }
+        UDR0 = *p++;
+    }
+}
 
 void serve_serial(void)
 {
@@ -54,7 +173,7 @@ void serve_serial(void)
         if(new_target != m_pwm_target_value)
         {
             __disable_irq();
-            pid_Reset_Integrator(&m_pid);
+            reset_pid(m_pid_controller);
             m_pwm_target_value = new_target * 1000u;
             __enable_irq();
         }
@@ -71,6 +190,18 @@ void serve_serial(void)
                    m_pwm_target_value,
                    pwm_set_latch);
     serial_write((void*)m_print_buf, len);
+}
+
+void serial_init(void)
+{
+    /* UART:
+     * Disable U2X bit (don't double transmission speed)
+     * Enable 8bit mode for transmit
+     * Enable trasnitter, receiver and character received interrupt */
+    UBRR0 = PRESCALER(BAUDRATE, MCU_FREQUENCY);
+    UCSR0A = 0xFC;
+    UCSR0C = ((1 << UCSZ01) | (1 << UCSZ00));
+    UCSR0B = ((1 << RXEN0) | (1 << TXEN0) | (1 << RXCIE0));
 }
 
 void init(void)
@@ -153,19 +284,11 @@ void init(void)
     ADCSRA |= (1 << ADSC);
 }
 
-#define K_P 1.0
-#define K_I 0.3
-#define K_D 1.0
-
 int main(void)
 {
     /* Initialize everything before enabling output */
     init();
     serial_init();
-    pid_Init(K_P * SCALING_FACTOR,
-             K_I * SCALING_FACTOR,
-             K_D * SCALING_FACTOR,
-             &m_pid);
     /* Finally enable output */
     pwm_fb_enable();
     output_enable();
@@ -185,9 +308,9 @@ ISR(ADC_vect)
     /* Value is right adjusted */
     ad_mv = ADC;
     ad_mv = adc_to_mv(ad_mv);
-    pid_out = pid_Controller(m_pwm_target_value,
-                             ad_mv,
-                             &m_pid);
+    pid_out = pid_run(m_pwm_target_value,
+                      ad_mv,
+                      &m_pid_controller);
     if(pid_out < 0)
     {
         /* Can't drive negative values */
@@ -226,4 +349,19 @@ ISR(TIMER2_OVF_vect)
 {
     /* Set new PWM period when timer count resets */
     OCR2A = m_pwm_set_value;
+}
+
+
+ISR(USART_RX_vect)
+{
+    ring_buffer_t *p = &m_uart_rx_buf;
+    /* Read byte regardless of buffer state (clears the pending IRQ) */
+    uint8_t ch = UDR0;
+    /* Is there room in buffer ? */
+    if (((p->in - p->out) & ~(RECEIVE_BUFFER - 1)) == 0)
+    {
+        /* Insert new item to head */
+        p->buf[p->in & (RECEIVE_BUFFER - 1)] = (uint8_t) (ch & 0xFF);
+        p->in++;
+    }
 }
